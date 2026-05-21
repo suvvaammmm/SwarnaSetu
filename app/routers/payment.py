@@ -7,10 +7,18 @@ from app.database import payments_collection, db, user_settings_collection
 from app.services.suggestion_engine import calculate_rounding
 from app.services.ledger_service import post_transaction
 from app.services.investment_service import create_pending_investment
+from app.services.investment_service import update_user_investment
+from app.database import user_investments_collection
+from app.services.auth_service import (
+    hash_password,
+    verify_password,
+    create_access_token
+)
 
 router = APIRouter()
 
 accounts_collection = db["accounts"]
+users_collection = db["users"]
 
 
 # ------------------------------------------------
@@ -20,30 +28,36 @@ accounts_collection = db["accounts"]
 @router.post("/topup")
 async def wallet_topup(user_id: str, amount: float):
 
-    user_account_id = f"acc_user_{user_id}"
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
 
-    user_account = await accounts_collection.find_one({"_id": user_account_id})
+    # Find user
+    user_account = await accounts_collection.find_one({"_id": user_id})
 
     if not user_account:
         raise HTTPException(status_code=404, detail="User wallet not found")
 
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount")
+    # Current balance
+    current_balance = float(user_account.get("balance", 0))
 
-    # Escrow → Wallet
-    txn_id = await post_transaction(
-        entries=[
-            {"account_id": "acc_platform_escrow", "type": "debit", "amount": amount},
-            {"account_id": user_account_id, "type": "credit", "amount": amount}
-        ],
-        txn_type="topup",
-        description="Wallet top-up"
+    # New balance
+    new_balance = current_balance + amount
+
+    # Update MongoDB
+    await accounts_collection.update_one(
+        {"_id": user_id},
+        {
+            "$set": {
+                "balance": new_balance
+            }
+        }
     )
 
     return {
         "message": "Wallet topped up successfully",
-        "transaction_id": txn_id,
-        "amount": amount
+        "user_id": user_id,
+        "old_balance": current_balance,
+        "new_balance": new_balance
     }
 
 
@@ -57,8 +71,10 @@ async def make_payment(user_id: str, merchant_upi: str, amount: float):
     rounding_data = calculate_rounding(amount)
     spare_change = rounding_data["spare"]
 
-    user_account_id = f"acc_user_{user_id}"
+    # Correct user account ID
+    user_account_id = user_id
 
+    # Find user wallet
     user_account = await accounts_collection.find_one({"_id": user_account_id})
 
     if not user_account:
@@ -95,6 +111,10 @@ async def make_payment(user_id: str, merchant_upi: str, amount: float):
 
         ledger_txn = txn_id
         pending_id = None
+        await update_user_investment(
+    user_id,
+    spare_change
+)
 
     # ------------------------------------------------
     # MANUAL INVESTMENT MODE
@@ -126,8 +146,181 @@ async def make_payment(user_id: str, merchant_upi: str, amount: float):
     result = await payments_collection.insert_one(payment_doc)
 
     return {
-        "message": "Payment processed",
+        "message": "Payment processed successfully",
         "payment_id": str(result.inserted_id),
         "investment_mode": investment_mode,
         "rounding": rounding_data
+    }
+@router.get("/balance/{user_id}")
+async def get_balance(user_id: str):
+
+    user = await accounts_collection.find_one({"_id": user_id})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "user_id": user_id,
+        "balance": user["balance"],
+        "currency": user["currency"]
+    }
+@router.get("/transactions/{user_id}")
+async def get_transactions(user_id: str):
+
+    payments = await payments_collection.find(
+        {"user_id": user_id}
+    ).to_list(length=100)
+
+    for payment in payments:
+        payment["_id"] = str(payment["_id"])
+
+    return payments
+
+@router.post("/create-user")
+async def create_user(user_id: str):
+
+    existing = await accounts_collection.find_one({"_id": user_id})
+
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    user = {
+        "_id": user_id,
+        "type": "user",
+        "balance": 0,
+        "currency": "INR"
+    }
+
+    await accounts_collection.insert_one(user)
+
+    return {
+        "message": "User created successfully"
+    }
+    
+@router.post("/signup")
+async def signup(
+    username: str,
+    password: str
+):
+
+    existing_user = await users_collection.find_one({
+        "_id": username
+    })
+
+    existing_wallet = await accounts_collection.find_one({
+        "_id":username
+    })
+    
+    if existing_user or existing_wallet:
+        raise HTTPException(
+            status_code=400,
+            detail="User already exists"
+        )
+
+    hashed_password = hash_password(password)
+
+    user_doc = {
+        "_id": username,
+        "password": hashed_password
+    }
+
+    await users_collection.insert_one(user_doc)
+
+    wallet_doc = {
+        "_id": username,
+        "type": "user",
+        "balance": 0,
+        "currency": "INR"
+    }
+
+    await accounts_collection.insert_one(wallet_doc)
+
+    return {
+        "message": "Signup successful"
+    }
+    
+@router.post("/login")
+async def login(
+    username: str,
+    password: str
+):
+
+    user = await users_collection.find_one({
+        "_id": username
+    })
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    valid_password = verify_password(
+        password,
+        user["password"]
+    )
+
+    if not valid_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid password"
+        )
+
+    token = create_access_token({
+        "sub": username
+    })
+
+    return {
+        "access_token": token,
+        "token_type": "bearer"
+    }
+
+@router.get("/portfolio/{user_id}")
+async def get_portfolio(user_id: str):
+
+    investment = await user_investments_collection.find_one({
+        "_id": user_id
+    })
+
+    if not investment:
+
+        return {
+            "user_id": user_id,
+            "total_invested": 0,
+            "gold_grams": 0,
+            "portfolio_value": 0,
+            "profit_loss": 0
+        }
+
+    from app.services.gold_price_service import (
+        get_live_gold_price
+    )
+
+    current_gold_price = get_live_gold_price()
+
+    gold_grams = investment.get(
+        "gold_grams",
+        0
+    )
+
+    portfolio_value = (
+        gold_grams * current_gold_price
+    )
+
+    total_invested = investment.get(
+        "total_invested",
+        0
+    )
+
+    profit_loss = (
+        portfolio_value - total_invested
+    )
+
+    return {
+        "user_id": user_id,
+        "total_invested": total_invested,
+        "gold_grams": gold_grams,
+        "current_gold_price": current_gold_price,
+        "portfolio_value": portfolio_value,
+        "profit_loss": profit_loss
     }
